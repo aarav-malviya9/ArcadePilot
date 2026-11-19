@@ -1,5 +1,5 @@
 """Tests for lab instruction parser."""
-from core.lab_parser import parse_markdown_steps, extract_gcloud_commands
+from core.lab_parser import parse_markdown_steps, extract_all_commands
 
 
 def test_parse_numbered_steps():
@@ -16,7 +16,7 @@ def test_parse_numbered_steps():
 
 def test_extract_gcloud_commands():
     text = "Run `gcloud projects list` and then `python script.py`"
-    cmds = extract_gcloud_commands(text)
+    cmds = extract_all_commands(text)
     assert any("gcloud" in c for c in cmds)
     assert any("python" in c for c in cmds)
 

@@ -1,1 +1,8 @@
 [2026-11-19T16:49:08] INFO     arcadepilot - Parsed 3 tasks from lab instructions
+[2026-11-19T16:52:26] INFO     arcadepilot - Browser driver started
+[2026-11-19T17:12:18] INFO     arcadepilot - Database initialized at C:\Claude Projects\ArcadePilot\storage\arcadepilot.db (v2)
+[2026-11-19T17:14:37] INFO     arcadepilot - Database initialized at storage/arcadepilot.db (v2)
+[2026-11-19T17:16:14] INFO     arcadepilot - Database initialized at storage/arcadepilot.db (v2)
+[2026-11-19T17:16:14] INFO     arcadepilot - Database initialized at storage/arcadepilot.db (v2)
+[2026-11-19T17:16:59] INFO     arcadepilot - Database initialized at storage/test_integration.db (v2)
+[2026-11-19T17:17:21] INFO     arcadepilot - Database initialized at storage/arcadepilot.db (v2)

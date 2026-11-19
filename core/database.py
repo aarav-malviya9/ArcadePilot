@@ -1,15 +1,28 @@
-"""SQLite persistence layer — sync sqlite3, no aiosqlite."""
+"""SQLite persistence layer — sync sqlite3."""
 from __future__ import annotations
 
 import json
 import sqlite3
-import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Generator, Optional
 
-_SCHEMA_VERSION = 1
+from core.logger import log
+from core.schemas import CREATE_TABLES_SQL, SCHEMA_VERSION
+
+
+def _migrate(conn) -> None:
+    """Add missing columns safely."""
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(labs)").fetchall()}
+    if "gcp_project" not in existing_cols:
+        conn.execute("ALTER TABLE labs ADD COLUMN gcp_project TEXT")
+    if "arcadepoints" not in existing_cols:
+        conn.execute("ALTER TABLE labs ADD COLUMN arcadepoints INTEGER DEFAULT 0")
+
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "gcp_service" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN gcp_service TEXT")
 
 
 def _now_iso() -> str:
@@ -31,116 +44,35 @@ def init_db(db_path: str) -> None:
     with _connect(db_path) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_info (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS labs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                url TEXT,
-                description TEXT,
-                source TEXT DEFAULT 'manual',
-                status TEXT DEFAULT 'not_started' CHECK(status IN ('not_started','in_progress','completed','failed')),
-                progress_pct INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lab_id INTEGER NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
-                title TEXT NOT NULL,
-                description TEXT,
-                required_op TEXT,
-                prereqs TEXT DEFAULT '[]',
-                suggested_cmds TEXT DEFAULT '[]',
-                expected_output TEXT,
-                verification_procedure TEXT,
-                status TEXT DEFAULT 'pending' CHECK(status IN ('pending','running','verified','failed','manual_required','skipped')),
-                completed_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS command_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lab_id INTEGER REFERENCES labs(id) ON DELETE SET NULL,
-                task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-                command TEXT NOT NULL,
-                risk_level TEXT NOT NULL,
-                approved INTEGER NOT NULL DEFAULT 0,
-                output TEXT,
-                stderr TEXT,
-                exit_code INTEGER,
-                started_at TEXT NOT NULL,
-                finished_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                level TEXT NOT NULL,
-                message TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_tasks_lab ON tasks(lab_id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cmd_history_lab ON command_history(lab_id)
-            """
-        )
-        # Apply migrations if needed
+        conn.executescript(CREATE_TABLES_SQL)
+
         existing = {
             row["key"]: row["value"]
             for row in conn.execute("SELECT key, value FROM schema_info").fetchall()
         }
-        if existing.get("version") != str(_SCHEMA_VERSION):
-            _apply_migrations(conn, int(existing.get("version", 0)))
+        from_version = int(existing.get("version", 0))
+
+        # Safe migration: add missing columns only
+        _migrate(conn)
+
         conn.execute(
             "INSERT OR REPLACE INTO schema_info (key, value) VALUES (?, ?)",
-            ("version", str(_SCHEMA_VERSION)),
+            ("version", str(SCHEMA_VERSION)),
         )
         conn.commit()
-
-
-def _apply_migrations(conn: sqlite3.Connection, from_version: int) -> None:
-    if from_version < 1:
-        pass  # base schema already covers v1
+    log.info(f"Database initialized at {db_path} (v{SCHEMA_VERSION})")
 
 
 # -- Lab CRUD --
 
 
-def create_lab(name: str, url: str = "", description: str = "") -> int:
+def create_lab(name: str, url: str = "", description: str = "", source: str = "manual") -> int:
     now = _now_iso()
     with _connect(DB_PATH) as conn:
         cur = conn.execute(
-            """
-            INSERT INTO labs (name, url, description, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'not_started', ?, ?)
-            """,
-            (name, url or None, description or None, now, now),
+            """INSERT INTO labs (name, url, description, source, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'not_started', ?, ?)""",
+            (name, url or None, description or None, source, now, now),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -149,14 +81,10 @@ def create_lab(name: str, url: str = "", description: str = "") -> int:
 def list_labs() -> list[dict[str, Any]]:
     with _connect(DB_PATH) as conn:
         rows = conn.execute(
-            """
-            SELECT l.*, COUNT(t.id) AS task_count,
-                   SUM(CASE WHEN t.status = 'verified' THEN 1 ELSE 0 END) AS done_tasks
-            FROM labs l
-            LEFT JOIN tasks t ON t.lab_id = l.id
-            GROUP BY l.id
-            ORDER BY l.updated_at DESC
-            """
+            """SELECT l.*, COUNT(t.id) AS task_count,
+                      SUM(CASE WHEN t.status = 'verified' THEN 1 ELSE 0 END) AS done_tasks
+               FROM labs l LEFT JOIN tasks t ON t.lab_id = l.id
+               GROUP BY l.id ORDER BY l.updated_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -167,21 +95,27 @@ def get_lab(lab_id: int) -> Optional[dict[str, Any]]:
         return dict(row) if row else None
 
 
-def update_lab_status(lab_id: int, status: str, progress_pct: int | None = None) -> None:
+def update_lab_status(lab_id: int, status: str, progress_pct: int | None = None, arcadepoints: int | None = None) -> None:
     now = _now_iso()
-    extra = f", progress_pct = COALESCE(?, progress_pct)" if progress_pct is not None else ""
+    set_cols = ["status = ?", "updated_at = ?"]
+    params = [status, now]
+    if progress_pct is not None:
+        set_cols.append("progress_pct = ?")
+        params.append(progress_pct)
+    if arcadepoints is not None:
+        set_cols.append("arcadepoints = ?")
+        params.append(arcadepoints)
+    params.append(lab_id)
     with _connect(DB_PATH) as conn:
-        conn.execute(
-            f"UPDATE labs SET status = ?, updated_at = ?{extra} WHERE id = ?",
-            (status, now, progress_pct, lab_id),
-        )
+        conn.execute(f"UPDATE labs SET {', '.join(set_cols)} WHERE id = ?", params)
         conn.commit()
 
 
-def delete_lab(lab_id: int) -> None:
+def delete_lab(lab_id: int) -> bool:
     with _connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM labs WHERE id = ?", (lab_id,))
+        cur = conn.execute("DELETE FROM labs WHERE id = ?", (lab_id,))
         conn.commit()
+        return cur.rowcount > 0
 
 
 # -- Task CRUD --
@@ -192,6 +126,7 @@ def create_task(
     title: str,
     description: str = "",
     required_op: str = "",
+    gcp_service: str = "",
     prereqs: list[str] | None = None,
     suggested_cmds: list[str] | None = None,
     expected_output: str = "",
@@ -200,23 +135,18 @@ def create_task(
     now = _now_iso()
     with _connect(DB_PATH) as conn:
         cur = conn.execute(
-            """
-            INSERT INTO tasks (lab_id, title, description, required_op,
-                               prereqs, suggested_cmds, expected_output,
-                               verification_procedure, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-            """,
+            """INSERT INTO tasks (lab_id, title, description, required_op, gcp_service,
+                                  prereqs, suggested_cmds, expected_output,
+                                  verification_procedure, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
             (
-                lab_id,
-                title,
-                description or None,
-                required_op or None,
+                lab_id, title, description or None, required_op or None,
+                gcp_service or None,
                 json.dumps(prereqs or []),
                 json.dumps(suggested_cmds or []),
                 expected_output or None,
                 verification_procedure or None,
-                now,
-                now,
+                now, now,
             ),
         )
         conn.commit()
@@ -263,10 +193,7 @@ def update_task_status(task_id: int, status: str) -> None:
         vals["completed_at"] = now
     with _connect(DB_PATH) as conn:
         set_clauses = ", ".join(f"{k} = ?" for k in vals)
-        conn.execute(
-            f"UPDATE tasks SET {set_clauses} WHERE id = ?",
-            [*vals.values(), task_id],
-        )
+        conn.execute(f"UPDATE tasks SET {set_clauses} WHERE id = ?", [*vals.values(), task_id])
         conn.commit()
 
 
@@ -279,45 +206,37 @@ def append_command_history(
     command: str,
     risk_level: str,
     approved: bool,
-    output: str = "",
+    stdout: str = "",
     stderr: str = "",
     exit_code: int | None = None,
+    duration_sec: float | None = None,
 ) -> int:
     now = _now_iso()
     with _connect(DB_PATH) as conn:
         cur = conn.execute(
-            """
-            INSERT INTO command_history
-              (lab_id, task_id, command, risk_level, approved, output, stderr, exit_code, started_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            """INSERT INTO command_history
+               (lab_id, task_id, command, risk_level, approved, stdout, stderr, exit_code, started_at, finished_at, duration_sec)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                lab_id,
-                task_id,
-                command,
-                risk_level,
-                int(approved),
-                output or None,
-                stderr or None,
-                exit_code,
-                now,
-                now,
+                lab_id, task_id, command, risk_level,
+                int(approved), stdout or None, stderr or None,
+                exit_code, now, now, duration_sec,
             ),
         )
         conn.commit()
         return int(cur.lastrowid)
 
 
-def list_command_history(lab_id: int | None = None) -> list[dict[str, Any]]:
+def list_command_history(lab_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
     with _connect(DB_PATH) as conn:
         if lab_id:
             rows = conn.execute(
-                "SELECT * FROM command_history WHERE lab_id = ? ORDER BY id DESC LIMIT 200",
-                (lab_id,),
+                "SELECT * FROM command_history WHERE lab_id = ? ORDER BY id DESC LIMIT ?",
+                (lab_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM command_history ORDER BY id DESC LIMIT 500"
+                "SELECT * FROM command_history ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -348,24 +267,18 @@ def list_recent_activities(limit: int = 50) -> list[dict[str, Any]]:
 def get_stats() -> dict[str, Any]:
     with _connect(DB_PATH) as conn:
         total = conn.execute("SELECT COUNT(*) FROM labs").fetchone()[0]
-        completed = conn.execute(
-            "SELECT COUNT(*) FROM labs WHERE status = 'completed'"
-        ).fetchone()[0]
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM labs WHERE status = 'in_progress'"
-        ).fetchone()[0]
-        failed = conn.execute(
-            "SELECT COUNT(*) FROM labs WHERE status = 'failed'"
-        ).fetchone()[0]
-        not_started = conn.execute(
-            "SELECT COUNT(*) FROM labs WHERE status = 'not_started'"
-        ).fetchone()[0]
+        completed = conn.execute("SELECT COUNT(*) FROM labs WHERE status = 'completed'").fetchone()[0]
+        in_progress = conn.execute("SELECT COUNT(*) FROM labs WHERE status = 'in_progress'").fetchone()[0]
+        failed = conn.execute("SELECT COUNT(*) FROM labs WHERE status = 'failed'").fetchone()[0]
+        paused = conn.execute("SELECT COUNT(*) FROM labs WHERE status = 'paused'").fetchone()[0]
+        total_arcadepoints = conn.execute("SELECT COALESCE(SUM(arcadepoints), 0) FROM labs WHERE status = 'completed'").fetchone()[0]
         return {
             "total": total,
             "completed": completed,
             "in_progress": in_progress,
             "failed": failed,
-            "not_started": not_started,
+            "paused": paused,
+            "total_arcadepoints": total_arcadepoints,
         }
 
 

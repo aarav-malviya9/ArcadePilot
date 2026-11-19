@@ -1,11 +1,14 @@
-"""Terminal page — command execution with safety gate."""
+"""Terminal page — real command execution with safety gate."""
 from __future__ import annotations
 
+import time
+from datetime import datetime
+
 import streamlit as st
+from core import database as db
 from core.config import Config
-from core.logger import log
+from core.safety import classify, RiskLevel
 from cloud.executor import execute_command
-from cloud.gcloud import detect_gcloud
 
 
 def render():
@@ -13,90 +16,127 @@ def render():
     config = Config.from_env()
 
     # gcloud status
-    gc_status = detect_gcloud(config.gcloud_path)
-    if gc_status.installed:
-        st.success(f"gcloud installed: {gc_status.version}")
-    else:
-        st.warning(
-            "gcloud CLI not detected. "
-            "Install from https://cloud.google.com/sdk/docs/install"
-        )
+    col_g, col_c = st.columns([2, 1])
+    with col_g:
+        st.subheader("GCP Status")
+        gc_info = get_gcloud_status(config.gcloud_path)
+        for k, v in gc_info.items():
+            st.caption(f"{k}: {v}")
+    with col_c:
+        st.markdown("---")
+        if st.button("Refresh Status", use_container_width=True):
+            st.rerun()
 
     st.markdown("---")
-    st.subheader("Command Execution")
+    st.subheader("Execute Command")
 
     command = st.text_input(
-        "Enter command",
+        "Command",
         placeholder="gcloud projects list",
-        key="terminal_cmd",
+        key="term_cmd",
+        help="Type a gcloud or shell command to execute.",
     )
 
-    risk_label, risk_color = "—", "#888"
+    # Live risk preview
     if command.strip():
-        from core.safety import classify
-        result = classify(command)
-        risk_label = result.risk.value.upper()
-        risk_color = {"safe": "#4caf50", "review": "#ff9800", "dangerous": "#f44336"}.get(
-            result.risk.value, "#888"
+        safety = classify(command)
+        color_map = {"safe": "#4caf50", "review": "#ff9800", "dangerous": "#f44336"}
+        c = color_map.get(safety.risk.value, "#888")
+        st.markdown(
+            f"<div style='padding:8px;background:#1a1a1a;border-radius:6px;border-left:4px solid {c};'>"
+            f"<b>Risk:</b> <span style='color:{c}'>{safety.risk.value.upper()}</span>"
+            f"&nbsp;&nbsp;<b>Note:</b> {safety.message}"
+            f"</div>",
+            unsafe_allow_html=True,
         )
-        st.caption(f"Risk level: <span style='color:{risk_color}'>{risk_label}</span>", unsafe_allow_html=True)
 
-    col_exec, col_preview = st.columns([1, 3])
-    with col_exec:
-        approve_btn = st.button("Execute", type="primary", disabled=not command.strip())
+    exec_col, preview_col = st.columns([1, 3])
+    with exec_col:
+        can_exec = bool(command.strip()) and (safety.risk != RiskLevel.DANGEROUS or config.approve_destructive_commands)
+        if st.button("Execute", type="primary", disabled=not can_exec):
+            _execute_and_show(command, config)
 
-    with col_preview:
+    with preview_col:
         if command.strip():
             st.code(command, language="bash")
 
-    if approve_btn and command.strip():
-        from core.safety import classify
-        safety = classify(command)
-        if safety.requires_approval and not config.approve_destructive_commands:
-            with st.expander(f"⚠️ Approve: {safety.risk.value.upper()} command"):
-                st.write(safety.message)
-                st.code(command, language="bash")
-                confirm = st.checkbox("I understand and want to proceed")
-                if confirm:
-                    exec_result = execute_command(
-                        command,
-                        timeout=config.ai_timeout_sec * 2,
-                        approve_destructive=False,
-                    )
-                    _display_execution(exec_result)
-                    st.rerun()
-                else:
-                    st.info("Execution cancelled by user")
-        else:
-            exec_result = execute_command(
-                command,
-                timeout=config.ai_timeout_sec * 2,
-                approve_destructive=config.approve_destructive_commands,
-            )
-            _display_execution(exec_result)
-            st.rerun()
-
     # History
     st.markdown("---")
-    st.subheader("Command History")
-    history = [
-        {"command": h["command"], "risk": h["risk_level"], "exit": h["exit_code"], "ts": h["started_at"]}
-        for h in reversed(__import__("core.database", fromlist=["list_command_history"]).list_command_history())
-    ][:20]
-    for entry in history:
-        with st.expander(f"{entry['ts'][:19]} | exit={entry['exit']} | [{entry['risk']}]"):
-            st.code(entry["command"], language="bash")
+    st.subheader("Recent Commands")
+    history = db.list_command_history(limit=30)
+    if not history:
+        st.info("No commands executed yet.")
+        return
+    for entry in reversed(history[-10:]):
+        ok_icon = "✅" if entry["exit_code"] == 0 else "❌" if entry["exit_code"] is not None else "⏳"
+        with st.expander(f"{ok_icon} `{entry['command'][:60]}` — exit {entry['exit_code']} [{entry['risk_level']}]"):
+            st.caption(f"Time: {entry['started_at'][11:19]}")
+            if entry.get("stdout"):
+                st.code(entry["stdout"][:2000], language="text")
+            if entry.get("stderr"):
+                st.code(entry["stderr"][:2000], language="text")
 
 
-def _display_execution(result) -> None:
-    """Show execution results in UI."""
-    if result.approved:
-        st.success(f"Executed (exit code: {result.exit_code})")
+def _execute_and_show(command: str, config: Config) -> None:
+    safety = classify(command)
+
+    # Require approval for non-safe commands unless auto-approved
+    if safety.requires_approval and not config.auto_execute_safe_commands and safety.risk != RiskLevel.SAFE:
+        with st.expander(f"⚠️ Approve: {safety.risk.value.upper()} command", expanded=True):
+            st.warning(safety.message)
+            st.code(command, language="bash")
+            if st.checkbox("I approve this command"):
+                _run_cmd(command, config)
+            else:
+                st.info("Execution cancelled")
+    elif safety.risk == RiskLevel.DANGEROUS and not config.approve_destructive_commands:
+        st.error("Destructive commands are blocked. Enable in Settings to allow.")
+        return
     else:
-        st.error("Command blocked by safety policy")
-    if result.stdout:
-        with st.expander("STDOUT"):
-            st.code(result.stdout, language="text")
-    if result.stderr:
-        with st.expander("STDERR"):
-            st.code(result.stderr, language="text")
+        _run_cmd(command, config)
+
+
+def _run_cmd(command: str, config: Config) -> None:
+    with st.status("Executing...", expanded=True) as status:
+        t0 = time.time()
+        result = execute_command(
+            command,
+            timeout=config.ai_timeout_sec * 2,
+            approve_destructive=config.approve_destructive_commands,
+        )
+        duration = round(time.time() - t0, 1)
+
+        if result.approved:
+            status.update(label=f"Done ({duration}s)", state="complete")
+            if result.exit_code == 0:
+                st.success(f"Completed in {duration}s — exit code 0")
+            else:
+                st.error(f"Exit code {result.exit_code} after {duration}s")
+        else:
+            st.error(result.stderr or "Command was blocked by safety policy")
+            status.update(label="Blocked", state="error")
+
+        if result.stdout:
+            with st.expander("STDOUT"):
+                st.code(result.stdout[:5000], language="text")
+        if result.stderr:
+            with st.expander("STDERR"):
+                st.code(result.stderr[:2000], language="text")
+
+
+def get_gcloud_status(path: str) -> dict:
+    """Return quick gcloud status info."""
+    import shutil, subprocess
+    info = {}
+    if shutil.which(path):
+        try:
+            r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+            info["Version"] = r.stdout.splitlines()[0].strip() if r.returncode == 0 else "?"
+            r2 = subprocess.run([path, "auth", "list", "--format=value(account)"], capture_output=True, text=True, timeout=10)
+            accounts = r2.stdout.strip().split("\n") if r2.returncode == 0 else []
+            info["Accounts"] = f"{len(accounts)}"
+        except Exception:
+            info["Status"] = "unknown"
+    else:
+        info["Installed"] = "No — install from cloud.google.com/sdk"
+    return info

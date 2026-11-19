@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import queue
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -11,7 +10,7 @@ from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
 
 
 class _Request:
-    def __init__(self, cmd, args=(), kwargs=None):
+    def __init__(self, cmd: str, args=(), kwargs=None):
         self.cmd = cmd
         self.args = args
         self.kwargs = kwargs or {}
@@ -32,6 +31,9 @@ class BrowserDriver(threading.Thread):
         self._q: queue.Queue = queue.Queue()
         self._started = threading.Event()
         self._stopped = threading.Event()
+        # Public read-only accessors
+        self.connected = False
+        self.current_url = ""
 
     def start_driver(self) -> dict:
         req = _Request("start")
@@ -39,13 +41,16 @@ class BrowserDriver(threading.Thread):
         try:
             return req.resp_queue.get(timeout=self._timeout_sec + 5)
         except queue.Empty:
-            return {"ok": False, "error": "timeout waiting for driver"}
+            return {"ok": False, "error": "timeout"}
 
     def navigate(self, url: str) -> dict:
         req = _Request("navigate", args=(url,))
         self._q.put(req)
         try:
-            return req.resp_queue.get(timeout=self._timeout_sec + 5)
+            result = req.resp_queue.get(timeout=self._timeout_sec + 5)
+            if result["ok"]:
+                self.current_url = result.get("url", url)
+            return result
         except queue.Empty:
             return {"ok": False, "error": "timeout navigating"}
 
@@ -72,6 +77,14 @@ class BrowserDriver(threading.Thread):
             return req.resp_queue.get(timeout=self._timeout_sec + 5)
         except queue.Empty:
             return {"ok": False, "error": "timeout clicking"}
+
+    def fill(self, selector: str, value: str) -> dict:
+        req = _Request("fill", args=(selector, value))
+        self._q.put(req)
+        try:
+            return req.resp_queue.get(timeout=self._timeout_sec + 5)
+        except queue.Empty:
+            return {"ok": False, "error": "timeout filling"}
 
     def stop(self) -> None:
         req = _Request("stop")
@@ -101,6 +114,9 @@ class BrowserDriver(threading.Thread):
             elif req.cmd == "click":
                 ok, err = self._do_click(req.args[0])
                 req.resp_queue.put({"ok": ok, "error": err})
+            elif req.cmd == "fill":
+                ok, err = self._do_fill(req.args[0], req.args[1])
+                req.resp_queue.put({"ok": ok, "error": err})
 
     def _do_start(self) -> tuple[bool, str]:
         try:
@@ -112,6 +128,8 @@ class BrowserDriver(threading.Thread):
             )
             pages = self._context.pages
             self._page = pages[0] if pages else self._context.new_page()
+            self.connected = True
+            self.current_url = self._page.url
             return True, ""
         except Exception as exc:
             return False, str(exc)
@@ -119,9 +137,11 @@ class BrowserDriver(threading.Thread):
     def _do_navigate(self, url: str) -> tuple[bool, str, str]:
         try:
             self._page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_sec * 1000)
-            return True, "", self._page.url
+            new_url = self._page.url
+            self.current_url = new_url
+            return True, "", new_url
         except Exception as exc:
-            return False, str(exc), self._page.url if self._page else ""
+            return False, str(exc), self.current_url
 
     def _do_get_text(self) -> tuple[bool, str, str]:
         try:
@@ -142,16 +162,24 @@ class BrowserDriver(threading.Thread):
     def _do_click(self, selector: str) -> tuple[bool, str]:
         try:
             self._page.click(selector, timeout=self._timeout_sec * 1000)
+            self.current_url = self._page.url
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    def _do_fill(self, selector: str, value: str) -> tuple[bool, str]:
+        try:
+            self._page.fill(selector, value, timeout=self._timeout_sec * 1000)
             return True, ""
         except Exception as exc:
             return False, str(exc)
 
     def _cleanup(self) -> None:
-        for attr in ("_context", "_browser", "_pw"):
-            obj = getattr(self, attr)
+        for obj in (self._context, self._browser, self._pw):
             try:
                 if obj is not None:
                     obj.close()
             except Exception:
                 pass
         self._page = None
+        self.connected = False

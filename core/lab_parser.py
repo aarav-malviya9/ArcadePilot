@@ -1,9 +1,11 @@
-"""Lab instruction parser — deterministic first, LLM fallback."""
+"""Universal lab instruction parser with GCP service detection."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+from core.gcp_services import detect_gcp_service, GCService
 
 
 @dataclass
@@ -11,42 +13,33 @@ class Task:
     title: str
     description: str = ""
     required_op: str = ""
-    prereqs: list[str] = field(default_factory=list)
+    gcp_services: list[str] = field(default_factory=list)
+    prerequisites: list[str] = field(default_factory=list)
     suggested_cmds: list[str] = field(default_factory=list)
     expected_output: str = ""
     verification_procedure: str = ""
+    requires_manual: bool = False
 
 
 def parse_markdown_steps(text: str) -> list[Task]:
     """Extract tasks from markdown-style numbered/bulleted steps."""
     tasks: list[Task] = []
-    lines = text.splitlines()
-    current_task: dict | None = None
-
     step_pattern = re.compile(r"^(\d+)\.\s+(.+)", re.MULTILINE)
-    bullet_pattern = re.compile(r"^[-*]\s+(.+)", re.MULTILINE)
+    header_pattern = re.compile(r"^(#{1,3})\s+(.+)", re.MULTILINE)
 
-    # Try numbered steps first
     for match in step_pattern.finditer(text):
-        num = int(match.group(1))
         content = match.group(2).strip()
-        task = _extract_task_from_line(content, num)
+        task = _extract_task(content)
         tasks.append(task)
 
-    if tasks:
-        return tasks
-
-    # Fall back to bullets or section headers
-    header_pattern = re.compile(r"^(#+)\s+(.+)", re.MULTILINE)
-    for match in header_pattern.finditer(text):
-        level = len(match.group(1))
-        title = match.group(2).strip()
-        if level <= 3 and title:
-            task = Task(title=title, description=f"Complete: {title}")
-            tasks.append(task)
+    if not tasks:
+        for match in header_pattern.finditer(text):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            if level <= 3 and title:
+                tasks.append(_extract_task(title))
 
     if not tasks:
-        # Single paragraph → one task
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for i, para in enumerate(paragraphs, 1):
             if len(para) > 20:
@@ -55,61 +48,77 @@ def parse_markdown_steps(text: str) -> list[Task]:
     return tasks or [Task(title="Complete the lab", description=text[:500])]
 
 
-def _extract_task_from_line(line: str, index: int) -> Task:
+def _extract_task(line: str) -> Task:
     task = Task(title=line[:100], description=line)
 
-    # Look for command patterns in the line
+    # Detect commands
     cmd_patterns = [
         re.compile(r"`([^`]+)`"),
         re.compile(r"\$\s*(.+?)$"),
-        re.compile(r"Run:\s*(.+)$"),
-        re.compile(r"Execute:\s*(.+)$"),
-        re.compile(r"Type:\s*(.+)$"),
+        re.compile(r"(?:^|\n)\s*(gcloud|python3?|gsutil|kubectl|curl|bq)\b[^\n]*"),
     ]
     for pat in cmd_patterns:
-        m = pat.search(line)
-        if m:
+        for m in pat.finditer(line):
             cmd = m.group(1).strip().strip("`").strip()
-            if cmd and not any(c in cmd for c in ["# ", "//", "--"]):
+            if cmd and not cmd.startswith("#") and cmd not in task.suggested_cmds:
                 task.suggested_cmds.append(cmd)
-                break
 
-    # Detect op type
+    # Detect operations
     lower = line.lower()
-    if "create" in lower or "deploy" in lower:
+    if "create" in lower or "deploy" in lower or "build" in lower:
         task.required_op = "create"
-    elif "delete" in lower or "remove" in lower:
+    elif "delete" in lower or "remove" in lower or "destroy" in lower:
         task.required_op = "delete"
-    elif "list" in lower or "describe" in lower or "get" in lower:
+    elif "list" in lower or "describe" in lower or "get" in lower or "show" in lower:
         task.required_op = "read"
     elif "verify" in lower or "check" in lower or "confirm" in lower:
         task.required_op = "verify"
     else:
         task.required_op = "general"
 
+    # Detect manual-required signals
+    manual_signals = ["click", "open browser", "login", "enter your", "select from dropdown"]
+    if any(sig in lower for sig in manual_signals):
+        task.requires_manual = True
+
+    # Detect GCP services
+    services = detect_gcp_service(line)
+    task.gcp_services = [s.value for s in services]
+
     return task
 
 
-def extract_gcloud_commands(text: str) -> list[str]:
-    """Pull out obvious gcloud/python/shell commands from instructions."""
+def extract_all_commands(text: str) -> list[str]:
+    """Pull all visible CLI commands from instructions."""
     cmds: list[str] = []
     seen: set[str] = set()
 
-    # Pattern 1: Lines starting with known CLI prefixes (common format)
+    # Match lines that start with a CLI prefix (possibly after whitespace)
     for match in re.finditer(
-        r"(?:^|\n)\s*(gcloud|python3?|gsutil|kubectl|curl)\b[^\n]*",
+        r"(?:^|\n)\s*(gcloud|python3?|gsutil|kubectl|curl|bq)\b[^\n]*",
         text,
-        re.IGNORECASE,
+        re.IGNORECASE | re.MULTILINE,
     ):
         cmd = match.group(0).strip()
         if cmd not in seen:
             seen.add(cmd)
             cmds.append(cmd)
 
-    # Pattern 2: Backtick-quoted commands containing CLI keywords
+    # Also catch inline commands: ... gcloud something ...
+    for match in re.finditer(
+        r"\b(gcloud|python3?|gsutil|kubectl|curl|bq)\b[ \S]*",
+        text,
+        re.IGNORECASE,
+    ):
+        cmd = match.group(0).strip()
+        if len(cmd) > 5 and cmd not in seen:
+            seen.add(cmd)
+            cmds.append(cmd)
+
+    # Backtick-quoted commands containing CLI keywords
     for match in re.finditer(r"`([^`]+)`", text):
         inner = match.group(1).strip()
-        if any(kw in inner.lower() for kw in ("gcloud", "python", "gsutil", "kubectl", "curl")):
+        if any(kw in inner.lower() for kw in ("gcloud", "python", "gsutil", "kubectl", "curl", "bq")):
             if inner not in seen:
                 seen.add(inner)
                 cmds.append(inner)
