@@ -60,6 +60,8 @@ def init_db(db_path: str) -> None:
             ("version", str(SCHEMA_VERSION)),
         )
         conn.commit()
+    # Update global DB_PATH so all functions use the correct database
+    globals()["DB_PATH"] = db_path
     log.info(f"Database initialized at {db_path} (v{SCHEMA_VERSION})")
 
 

@@ -12,3 +12,5 @@
 [2026-11-19T17:22:17] INFO     arcadepilot - Database initialized at C:\Claude Projects\ArcadePilot\storage\arcadepilot.db (v2)
 [2026-11-19T17:23:01] INFO     arcadepilot - Database initialized at C:\Claude Projects\ArcadePilot\storage\arcadepilot.db (v2)
 [2026-11-19T17:25:01] INFO     arcadepilot - Database initialized at storage/arcadepilot.db (v2)
+[2026-11-19T17:27:40] INFO     arcadepilot - Database initialized at storage/test_final.db (v2)
+[2026-11-19T17:28:01] INFO     arcadepilot - Database initialized at storage/test2.db (v2)
